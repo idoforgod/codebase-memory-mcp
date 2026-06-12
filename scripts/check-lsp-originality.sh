@@ -13,8 +13,9 @@
 #   1. Verbatim string / error-message literals shared with a reference.
 #   2. Verbatim comment phrases shared with a reference (the classic port tell:
 #      people re-type the logic but keep the explanatory comments).
-#   3. (Optional, if `jscpd` is installed) same-language structural clones —
-#      meaningful only for clangd (C++ ↔ our C).
+#   3. Same-language structural clones via jscpd (uses `jscpd` on PATH, else
+#      `npx --yes jscpd`) — token-level clone detection, run only for clangd
+#      (C++ ↔ our C), the one reference close enough to C to tokenize alike.
 #
 # WHAT IT CANNOT CATCH (be honest — these need a human)
 #   An algorithm ported line-by-line with every identifier/comment rewritten is
@@ -44,6 +45,7 @@ REFS_DIR="${LSP_REFS_DIR:-$ROOT/.lsp-refs}"
 # Tunables (override via env).
 MIN_STR="${LSP_ORIG_MIN_STR:-16}"        # min length of a string literal to consider
 MIN_COMMENT="${LSP_ORIG_MIN_COMMENT:-30}" # min length of a comment phrase to consider
+MIN_TOKENS="${LSP_ORIG_MIN_TOKENS:-50}"   # jscpd structural-clone min token run
 
 # Reference manifest:  lang | git URL | sparse subpath (light checkout)
 REFS=(
@@ -158,15 +160,65 @@ for entry in "${REFS[@]}"; do
   fi
 done
 
+# --- 4. Structural-clone pass (clangd C++ <-> our C; the only same-ish language)
+# String search misses ports that kept the code structure but rewrote identifiers
+# and strings. jscpd is a token clone detector; it tokenizes per format, so we
+# stage both trees as .cpp (C tokenizes fine as C++) and report only clone pairs
+# that SPAN the two trees.
+structural_hits=0
+if [ -z "$ONLY_LANG" ] || [ "$ONLY_LANG" = "c" ]; then
+  JSCPD=""
+  if command -v jscpd >/dev/null 2>&1; then JSCPD="jscpd"
+  elif command -v npx >/dev/null 2>&1; then JSCPD="npx --yes jscpd"; fi
+  cdir="$REFS_DIR/c"
+  if [ -z "$JSCPD" ]; then
+    echo "$TAG structural pass skipped — install jscpd (npm i -g jscpd) or node/npx to enable"
+  elif [ ! -d "$cdir" ]; then
+    echo "$TAG structural pass skipped — clangd ref not fetched (run without --lang, or --lang c)"
+  else
+    stage="$(mktemp -d)"; jout="$(mktemp -d)"
+    for f in "${LSP_SRC[@]}"; do
+      cp "$f" "$stage/ours__$(echo "${f#$LSP_DIR/}" | tr '/' '_').cpp"
+    done
+    while IFS= read -r f; do
+      cp "$f" "$stage/clangd__$(echo "${f#$cdir/}" | tr '/' '_').cpp" 2>/dev/null
+    done < <(find "$cdir" -type f \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \
+                                      -o -name '*.h' -o -name '*.hpp' \))
+    echo "$TAG structural pass (jscpd, >= ${MIN_TOKENS} tokens, clangd C++ <-> our C) ..."
+    $JSCPD --silent --reporters json --output "$jout" --min-tokens "$MIN_TOKENS" "$stage" >/dev/null 2>&1 || true
+    pairs=""
+    if [ -f "$jout/jscpd-report.json" ]; then
+      pairs=$(jq -r '.duplicates[]?
+        | select((.firstFile.name|contains("ours__")) != (.secondFile.name|contains("ours__")))
+        | "  \(.firstFile.name|gsub(".*/";"")) <-> \(.secondFile.name|gsub(".*/";"")) [\(.lines) lines]"' \
+        "$jout/jscpd-report.json" 2>/dev/null | sort -u)
+    fi
+    if [ -n "$pairs" ]; then
+      echo "$TAG ⚠ structural clones spanning our C and clangd:"; echo "$pairs" | head -20
+      structural_hits=1
+    else
+      echo "$TAG ok — no structural clones (>= ${MIN_TOKENS} tokens) between our C and clangd"
+    fi
+    rm -rf "$stage" "$jout"
+  fi
+fi
+
 echo ""
-if [ "$total_hits" -gt 0 ]; then
-  echo "$TAG REVIEW NEEDED: $total_hits file(s) in reference sources contain a verbatim"
-  echo "$TAG string/comment also present in internal/cbm/lsp/. A hit is NOT proof of"
-  echo "$TAG copying (common phrases collide) — inspect each, confirm independent wording,"
-  echo "$TAG and reword genuinely-copied text. Re-run until clean before committing."
+if [ "$total_hits" -gt 0 ] || [ "$structural_hits" -gt 0 ]; then
+  if [ "$total_hits" -gt 0 ]; then
+    echo "$TAG REVIEW NEEDED: $total_hits reference file(s) share a verbatim string/comment"
+    echo "$TAG with internal/cbm/lsp/. A hit is NOT proof of copying (common phrases collide)"
+    echo "$TAG — inspect each, confirm independent wording, reword genuinely-copied text."
+  fi
+  if [ "$structural_hits" -gt 0 ]; then
+    echo "$TAG REVIEW NEEDED: jscpd found structurally-cloned block(s) between our C and"
+    echo "$TAG clangd — inspect the pairs above and confirm independent implementation."
+  fi
+  echo "$TAG Re-run until clean before committing."
   exit 1
 fi
-echo "$TAG CLEAN — no verbatim string/comment overlap with any reference language server."
-echo "$TAG (Reminder: this proves no verbatim overlap, not provable independence —"
-echo "$TAG  the incremental git history is the complementary evidence.)"
+echo "$TAG CLEAN — no verbatim string/comment overlap with any reference, and no"
+echo "$TAG structural clones (jscpd) between our C and clangd."
+echo "$TAG (Reminder: this proves no verbatim/structural overlap, not provable"
+echo "$TAG  independence — the incremental git history is the complementary evidence.)"
 exit 0
