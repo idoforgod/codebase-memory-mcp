@@ -322,6 +322,32 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* Dart: function_signature / method_signature have no `name` field; the name
+     * is an `identifier` child (method_signature wraps a function_signature). The
+     * shared resolver doesn't cover them, so resolve here for call-scope so an
+     * in-body call sources to the function, not the Module. */
+    if (ctx->language == CBM_LANG_DART && (strcmp(ts_node_type(node), "function_signature") == 0 ||
+                                           strcmp(ts_node_type(node), "method_signature") == 0)) {
+        TSNode sig = node;
+        if (strcmp(ts_node_type(node), "method_signature") == 0) {
+            TSNode fs = cbm_find_child_by_kind(node, "function_signature");
+            if (!ts_node_is_null(fs)) {
+                sig = fs;
+            }
+        }
+        TSNode id = cbm_find_child_by_kind(sig, "identifier");
+        if (!ts_node_is_null(id)) {
+            char *nm = cbm_node_text(ctx->arena, id, ctx->source);
+            if (nm && nm[0]) {
+                if (state->enclosing_class_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, nm);
+                }
+                return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, nm,
+                                                   ctx->language);
+            }
+        }
+    }
+
     /* Resolve the function name via the single shared resolver (extract_defs) so
      * call-scope attribution agrees with definition extraction across all ~130
      * grammars. The old private 4-case copy returned NULL for Fortran subroutine,
@@ -1069,6 +1095,24 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 const char *tqn =
                     cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
                 push_scope(state, SCOPE_CLASS, depth, tqn);
+            }
+        }
+    } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
+        /* Dart models a function as `function_signature` + `function_body` SIBLINGS
+         * (the signature node does not contain the body). A scope pushed at the
+         * signature never covers the body, so in-body calls source to the Module.
+         * Push the function scope at the BODY using the preceding signature
+         * sibling's QN, so the body's children attribute to the function. */
+        TSNode prev = ts_node_prev_sibling(node);
+        while (!ts_node_is_null(prev) &&
+               strcmp(ts_node_type(prev), "function_signature") != 0 &&
+               strcmp(ts_node_type(prev), "method_signature") != 0) {
+            prev = ts_node_prev_sibling(prev);
+        }
+        if (!ts_node_is_null(prev)) {
+            const char *fqn = compute_func_qn(ctx, prev, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
             }
         }
     }
