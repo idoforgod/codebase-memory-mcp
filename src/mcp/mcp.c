@@ -32,6 +32,7 @@ enum {
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
     MCP_RETURN_2 = 2,
+    MCP_TOOLS_PAGE_SIZE = 8,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -493,36 +494,109 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-char *cbm_mcp_tools_list(void) {
+static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
+
+static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
+                                const char *schema_json) {
+    yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
+    if (schema_doc) {
+        yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
+        if (schema) {
+            yyjson_mut_obj_add_val(doc, obj, key, schema);
+        }
+        yyjson_doc_free(schema_doc);
+    }
+}
+
+static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) {
+    yyjson_mut_val *tool = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
+    yyjson_mut_obj_add_str(doc, tool, "title", TOOLS[i].title);
+    yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
+
+    mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
+    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+
+    yyjson_mut_arr_add_val(tools, tool);
+}
+
+static char *cbm_mcp_tools_list_range(int offset, int limit, bool include_next_cursor) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_val *tools = yyjson_mut_arr(doc);
 
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        yyjson_mut_val *tool = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
-        yyjson_mut_obj_add_str(doc, tool, "title", TOOLS[i].title);
-        yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
+    if (offset < 0) {
+        offset = 0;
+    }
+    if (offset > TOOL_COUNT) {
+        offset = TOOL_COUNT;
+    }
+    if (limit < 0 || limit > TOOL_COUNT) {
+        limit = TOOL_COUNT;
+    }
 
-        /* Parse input schema JSON and embed */
-        yyjson_doc *schema_doc =
-            yyjson_read(TOOLS[i].input_schema, strlen(TOOLS[i].input_schema), 0);
-        if (schema_doc) {
-            yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
-            yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
-            yyjson_doc_free(schema_doc);
-        }
+    int end = offset + limit;
+    if (end > TOOL_COUNT) {
+        end = TOOL_COUNT;
+    }
 
-        yyjson_mut_arr_add_val(tools, tool);
+    for (int i = offset; i < end; i++) {
+        mcp_add_tool_def(doc, tools, i);
     }
 
     yyjson_mut_obj_add_val(doc, root, "tools", tools);
+    if (include_next_cursor && end < TOOL_COUNT) {
+        char cursor[32];
+        snprintf(cursor, sizeof(cursor), "%d", end);
+        yyjson_mut_obj_add_strcpy(doc, root, "nextCursor", cursor);
+    }
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+char *cbm_mcp_tools_list(void) {
+    return cbm_mcp_tools_list_range(0, TOOL_COUNT, false);
+}
+
+static int mcp_tools_cursor_offset(const char *params_json) {
+    if (!params_json) {
+        return 0;
+    }
+
+    yyjson_doc *doc = yyjson_read(params_json, strlen(params_json), 0);
+    if (!doc) {
+        return 0;
+    }
+
+    int offset = 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *cursor = root ? yyjson_obj_get(root, "cursor") : NULL;
+    if (cursor) {
+        offset = TOOL_COUNT;
+        if (yyjson_is_str(cursor)) {
+            const char *cursor_str = yyjson_get_str(cursor);
+            if (cursor_str && *cursor_str != '\0') {
+                char *endptr = NULL;
+                errno = 0;
+                long parsed = strtol(cursor_str, &endptr, 10);
+                if (endptr && *endptr == '\0' && errno == 0 && parsed >= 0) {
+                    offset = parsed > TOOL_COUNT ? TOOL_COUNT : (int)parsed;
+                }
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return offset;
+}
+
+static char *cbm_mcp_tools_list_page(const char *params_json) {
+    return cbm_mcp_tools_list_range(mcp_tools_cursor_offset(params_json), MCP_TOOLS_PAGE_SIZE,
+                                    true);
 }
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -4879,7 +4953,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
-        result_json = cbm_mcp_tools_list();
+        result_json = cbm_mcp_tools_list_page(req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =

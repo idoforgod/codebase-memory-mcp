@@ -194,6 +194,8 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Search graph\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
+    ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
+    ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
     free(json);
     PASS();
 }
@@ -373,6 +375,31 @@ TEST(server_handle_tools_list) {
     ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     ASSERT_NOT_NULL(strstr(resp, "query_graph"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_tools_list_paginates) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":200"));
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"8\""));
+    ASSERT_NOT_NULL(strstr(resp, "index_repository"));
+    ASSERT_NULL(strstr(resp, "manage_adr"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -2388,6 +2415,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_initialize);
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
+    RUN_TEST(server_handle_tools_list_paginates);
     RUN_TEST(server_handle_unknown_method);
 
     /* Server handle — edge cases */
