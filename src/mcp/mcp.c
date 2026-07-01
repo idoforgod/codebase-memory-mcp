@@ -1054,17 +1054,22 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         if (!db_internal_project_name(full_path, iname, sizeof(iname), NULL)) {
             continue;
         }
-        if ((size_t)offset >= out_sz)
-            break; /* bounds check before write */
-        if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
+        /* Element-boundary write: only emit this name if the WHOLE element —
+         * optional leading comma + "iname" — plus the NUL fits in what remains.
+         * Never truncate mid-token; a partial name would corrupt the JSON array
+         * (issue #235). Stop cleanly at the last name that fits: the array then
+         * always holds complete names and `count` == its length. */
+        size_t off = (size_t)offset;
+        size_t need = strlen(iname) + 2 /* quotes */ + (count > 0 ? 1u : 0u) /* comma */;
+        if (off + need + 1 > out_sz) {
+            break; /* would not fit entirely — stop at this element boundary */
+        }
+        if (count > 0) {
             out[offset++] = ',';
         }
         int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%s\"", iname);
         if (wrote > 0) {
-            offset += wrote;
-            if ((size_t)offset >= out_sz) {
-                offset = (int)out_sz - 1; /* clamp on truncation */
-            }
+            offset += wrote; /* guaranteed to fit (checked above) — no truncation */
         }
         count++;
     }

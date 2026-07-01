@@ -2500,6 +2500,112 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+/* Issue #235 (follow-up): with many long-named projects indexed,
+ * collect_db_project_names overflowed projects[CBM_SZ_4K] and truncated the
+ * LAST name MID-TOKEN, then clamped offset to out_sz-1 — emitting malformed,
+ * unterminated JSON like
+ *   ...,"available_projects":["a",...,"vjson_49_bbb],"count":50}
+ * (unclosed string + unclosed array). build_project_list_error wrapped that
+ * invalid body into the tool error, so a "project not found" reply was NOT
+ * valid JSON once enough projects were indexed.
+ *
+ * Reproduce-first: fill an isolated cache dir with enough long INTERNAL-named
+ * dbs to overflow the 4 KB buffer, hit the bad-project path, then assert the
+ * ERROR BODY (the inner MCP text content) parses as valid JSON and that
+ * available_projects is a JSON array whose length == count. RED on the
+ * truncating code (yyjson_read returns NULL on the mid-token cut); GREEN after
+ * the element-boundary fix, which only ever writes whole "name" tokens. */
+#define BADPROJ_JSON_DBNAME(buf, dir, i)                                                      \
+    snprintf((buf), sizeof(buf),                                                              \
+             "%s/vjson_%02d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.db",                       \
+             (dir), (i))
+TEST(tool_bad_project_error_valid_json_issue235) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-badproj-vjson-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* 50 * ~120-char INTERNAL names >> 4 KB → the available_projects buffer
+     * overflows and the last name is cut mid-token on the unfixed code. */
+    enum { BADPROJ_N = 50 };
+    for (int i = 0; i < BADPROJ_N; i++) {
+        char name[512];
+        BADPROJ_JSON_DBNAME(name, cache, i);
+        char iname[256];
+        snprintf(iname, sizeof(iname),
+                 "vjson_%02d_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                 i);
+        cbm_store_t *st = cbm_store_open_path(name);
+        if (st) {
+            cbm_store_upsert_project(st, iname, cache);
+            cbm_store_close(st);
+        }
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"label\":\"Function\","
+             "\"project\":\"definitely-not-a-real-project-xyz\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+
+    /* The inner MCP text content is the error body built by
+     * build_project_list_error. Capture its validity BEFORE cleanup so a RED
+     * failure still restores the environment. */
+    char *body = extract_text_content(resp);
+    bool body_valid = false;
+    bool aps_ok = false; /* available_projects is an array whose len == count */
+    if (body) {
+        yyjson_doc *bdoc = yyjson_read(body, strlen(body), 0);
+        if (bdoc) {
+            body_valid = true;
+            yyjson_val *broot = yyjson_doc_get_root(bdoc);
+            yyjson_val *aps = yyjson_obj_get(broot, "available_projects");
+            yyjson_val *cnt = yyjson_obj_get(broot, "count");
+            if (aps && yyjson_is_arr(aps) && cnt && yyjson_is_int(cnt)) {
+                aps_ok = (yyjson_arr_size(aps) == (size_t)yyjson_get_int(cnt));
+            }
+            yyjson_doc_free(bdoc);
+        }
+    }
+    free(body);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    for (int i = 0; i < BADPROJ_N; i++) {
+        char name[512];
+        BADPROJ_JSON_DBNAME(name, cache, i);
+        cbm_unlink(name);
+        char side[540];
+        snprintf(side, sizeof(side), "%s-wal", name);
+        cbm_unlink(side);
+        snprintf(side, sizeof(side), "%s-shm", name);
+        cbm_unlink(side);
+    }
+    cbm_rmdir(cache);
+
+    /* RED on the unfixed code: mid-token truncation → invalid JSON body. */
+    ASSERT_TRUE(body_valid);
+    ASSERT_TRUE(aps_ok);
+    PASS();
+}
+#undef BADPROJ_JSON_DBNAME
+
 /* ── #704: project resolution must key on the db's INTERNAL project name ──
  *
  * Issue #704: project resolution is registry-less and filename-addressed.
@@ -3085,5 +3191,6 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+    RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
 }
