@@ -130,6 +130,13 @@ static char *rpd_index_and_fingerprint(const char *repo, const char *dbpath) {
     return fp;
 }
 
+/* GUARD (green <=> the parallel-indexing races are fixed): repeated
+ * multi-threaded runs over a fixed corpus must produce the IDENTICAL sorted
+ * node+edge set. Root causes fixed (all order/scheduling dependence):
+ * semantic-pass admission + canonical funcs order, import target first-match,
+ * similarity ordering + id-based pair ownership, call-neighbor truncation
+ * subsets, and the QN-collision last-wins overwrite in gbuf upsert AND merge
+ * (a C struct/function/macro sharing one name flipped label by merge order). */
 TEST(repro_parallel_edge_determinism) {
     struct stat st;
     if (stat(RPD_CORPUS, &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -140,32 +147,60 @@ TEST(repro_parallel_edge_determinism) {
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_par_det.db", cbm_tmpdir());
 
-    /* Single-threaded reference graph. */
-    setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    char *fp_st = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
-    unsetenv("CBM_INDEX_SINGLE_THREAD");
-    ASSERT_NOT_NULL(fp_st);
-    ASSERT_TRUE(strlen(fp_st) > 0);
+    /* First multi-threaded run = reference; every further MT run must match. */
+    char *fp_ref = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    ASSERT_NOT_NULL(fp_ref);
+    ASSERT_TRUE(strlen(fp_ref) > 0);
 
-    /* Every multi-threaded run must reproduce the single-threaded graph exactly. */
     int diverged = 0;
-    for (int k = 0; k < RPD_MT_RUNS && !diverged; k++) {
+    for (int k = 1; k < RPD_MT_RUNS && !diverged; k++) {
         char *fp_mt = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
         ASSERT_NOT_NULL(fp_mt);
-        if (strcmp(fp_mt, fp_st) != 0)
+        if (strcmp(fp_mt, fp_ref) != 0)
             diverged = 1;
         free(fp_mt);
     }
 
     unlink(dbpath);
-    free(fp_st);
+    free(fp_ref);
 
-    /* RED today: parallel indexing diverges from the single-threaded graph.
-     * GREEN once the edge-production/merge race is fixed (MT == ST, every run). */
     ASSERT_EQ(diverged, 0);
+    PASS();
+}
+
+/* RED (open bug, fix deferred): the SEQUENTIAL pipeline and the PARALLEL
+ * pipeline are different code paths that produce SYSTEMATICALLY different
+ * graphs — on the xfs corpus they disagree on ~3459 USAGE, ~1666 WRITES and
+ * ~60 CALLS sorted-edge lines, consistently (each mode is internally
+ * deterministic after the race fixes above; the modes just don't agree).
+ * GREEN when both pipelines emit the same graph for the same corpus. */
+TEST(repro_seq_parallel_equivalence) {
+    struct stat st;
+    if (stat(RPD_CORPUS, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        SKIP("real-repo tier: corpus " RPD_CORPUS " absent");
+    }
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_seq_par.db", cbm_tmpdir());
+
+    setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char *fp_st = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    unsetenv("CBM_INDEX_SINGLE_THREAD");
+    ASSERT_NOT_NULL(fp_st);
+
+    char *fp_mt = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    ASSERT_NOT_NULL(fp_mt);
+
+    int equal = strcmp(fp_st, fp_mt) == 0;
+    unlink(dbpath);
+    free(fp_st);
+    free(fp_mt);
+
+    ASSERT_EQ(equal, 1);
     PASS();
 }
 
 void suite_repro_parallel_determinism(void) {
     RUN_TEST(repro_parallel_edge_determinism);
+    RUN_TEST(repro_seq_parallel_equivalence);
 }

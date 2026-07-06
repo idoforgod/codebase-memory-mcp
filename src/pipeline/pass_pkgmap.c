@@ -1515,6 +1515,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
+                /* Deterministic winner: hits[] is in node-registration order,
+                 * which under parallel extraction varies run to run — taking
+                 * the FIRST targetable hit made the same import resolve to
+                 * different same-named nodes across runs (xfs: 360 flickering
+                 * IMPORTS diff lines between two MT runs). Pick the candidate
+                 * with the lexicographically smallest qualified name instead:
+                 * stable, content-derived, identical for ST and MT. */
+                const cbm_gbuf_node_t *best = NULL;
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
                     if (!cand || !import_targetable_label(cand->label)) {
@@ -1524,7 +1532,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
                     }
-                    return cand;
+                    if (!best || (cand->qualified_name && best->qualified_name &&
+                                  strcmp(cand->qualified_name, best->qualified_name) < 0)) {
+                        best = cand;
+                    }
+                }
+                if (best) {
+                    return best;
                 }
             }
         }

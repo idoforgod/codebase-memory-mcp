@@ -652,13 +652,72 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
             (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
             return existing->id;
         }
+        /* Same-QN arrival. Two distinct cases:
+         *
+         * 1) The SAME source entity re-upserted (identity fields match) —
+         *    refresh in place, exactly as before.
+         *
+         * 2) A DIFFERENT source entity sharing the QN. In C a struct, a
+         *    function and a macro can all carry one name and the QN scheme
+         *    does not encode the entity kind, so they collide here. The old
+         *    code let the LAST arrival overwrite — under parallel extraction
+         *    the merge order varies run to run, so WHICH entity survived
+         *    (label/name/lines/props) flickered (xfs: Function-node count
+         *    4998 vs 5015 across two runs), and every order-sensitive
+         *    consumer downstream (semantic vectors, LSH, near-threshold
+         *    scores) inherited the flicker. Pick the survivor by a canonical
+         *    CONTENT rule instead — lexicographically smallest
+         *    (label, file_path, start_line, name) — so the outcome is a pure
+         *    function of the colliding entities, not of scheduling. Exactly
+         *    one entity is dropped, as one always was; kind-disambiguated
+         *    QNs (the real cure) are tracked as a follow-up. */
+        bool same_entity =
+            existing->label && label && strcmp(existing->label, label) == 0 &&
+            existing->file_path && file_path && strcmp(existing->file_path, file_path) == 0 &&
+            existing->start_line == start_line && existing->name && name &&
+            strcmp(existing->name, name) == 0;
+        if (!same_entity) {
+            int c = strcmp(label ? label : "", existing->label ? existing->label : "");
+            if (c == 0) {
+                c = strcmp(file_path ? file_path : "",
+                           existing->file_path ? existing->file_path : "");
+            }
+            if (c == 0) {
+                c = start_line - existing->start_line;
+            }
+            if (c == 0) {
+                c = strcmp(name ? name : "", existing->name ? existing->name : "");
+            }
+            if (c >= 0) {
+                return existing->id; /* existing entity is the canonical winner */
+            }
+        }
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
-         * label == existing->label), so the old value is replaced, never freed. */
+         * label == existing->label), so the old value is replaced, never freed.
+         * When the surviving label/name changes, keep the secondary indexes
+         * consistent (the old code left the node listed under its ORIGINAL
+         * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
+         * which is how the flickering Function set reached the semantic pass). */
         char *new_name = heap_strdup(name);
         char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        existing->label = (char *)gb_intern(gb, label);
+        const char *new_label_interned = gb_intern(gb, label);
+        bool label_changed = !existing->label || !new_label_interned ||
+                             strcmp(existing->label, new_label_interned) != 0;
+        bool name_changed =
+            !existing->name || !new_name || strcmp(existing->name, new_name) != 0;
+        if (label_changed) {
+            remove_node_from_ptr_array(
+                cbm_ht_get(gb->nodes_by_label, existing->label ? existing->label : ""),
+                existing->id);
+        }
+        if (name_changed) {
+            remove_node_from_ptr_array(
+                cbm_ht_get(gb->nodes_by_name, existing->name ? existing->name : ""),
+                existing->id);
+        }
+        existing->label = (char *)new_label_interned;
         free(existing->name);
         existing->name = new_name;
         existing->file_path = (char *)gb_intern(gb, file_path);
@@ -667,6 +726,16 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
         if (new_props) {
             free(existing->properties_json);
             existing->properties_json = new_props;
+        }
+        if (label_changed) {
+            node_ptr_array_t *by_label =
+                get_or_create_node_array(gb->nodes_by_label, existing->label ? existing->label : "");
+            cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
+        }
+        if (name_changed) {
+            node_ptr_array_t *by_name =
+                get_or_create_node_array(gb->nodes_by_name, existing->name ? existing->name : "");
+            cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
         }
         return existing->id;
     }
@@ -1131,15 +1200,73 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
         (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
     if (!module_on_container) {
-        existing->label = (char *)gb_intern(dst, sn->label);
-        free(existing->name);
-        existing->name = heap_strdup(sn->name);
-        existing->file_path = (char *)gb_intern(dst, sn->file_path);
-        existing->start_line = sn->start_line;
-        existing->end_line = sn->end_line;
-        if (sn->properties_json) {
-            free(existing->properties_json);
-            existing->properties_json = heap_strdup(sn->properties_json);
+        /* Canonical collision winner (determinism) — mirrors
+         * cbm_gbuf_upsert_node. Distinct source entities can share a QN (C:
+         * struct/function/macro with one name); unconditional "src wins" made
+         * the survivor depend on worker merge order, flickering the node set
+         * (and every downstream consumer) run to run. Same entity → refresh;
+         * different entity → keep the lexicographically smallest
+         * (label, file_path, start_line, name). */
+        bool same_entity =
+            existing->label && sn->label && strcmp(existing->label, sn->label) == 0 &&
+            existing->file_path && sn->file_path &&
+            strcmp(existing->file_path, sn->file_path) == 0 &&
+            existing->start_line == sn->start_line && existing->name && sn->name &&
+            strcmp(existing->name, sn->name) == 0;
+        bool sn_wins = true;
+        if (!same_entity) {
+            int c = strcmp(sn->label ? sn->label : "", existing->label ? existing->label : "");
+            if (c == 0) {
+                c = strcmp(sn->file_path ? sn->file_path : "",
+                           existing->file_path ? existing->file_path : "");
+            }
+            if (c == 0) {
+                c = sn->start_line - existing->start_line;
+            }
+            if (c == 0) {
+                c = strcmp(sn->name ? sn->name : "", existing->name ? existing->name : "");
+            }
+            sn_wins = c < 0;
+        }
+        if (sn_wins) {
+            /* Keep the secondary indexes consistent when the surviving
+             * label/name changes (the old code left the node listed under its
+             * original label/name, so find_by_label/name mis-listed it). */
+            const char *new_label = gb_intern(dst, sn->label);
+            bool label_changed = !existing->label || !new_label ||
+                                 strcmp(existing->label, new_label) != 0;
+            bool name_changed = !existing->name || !sn->name ||
+                                strcmp(existing->name, sn->name) != 0;
+            if (label_changed) {
+                remove_node_from_ptr_array(
+                    cbm_ht_get(dst->nodes_by_label, existing->label ? existing->label : ""),
+                    existing->id);
+            }
+            if (name_changed) {
+                remove_node_from_ptr_array(
+                    cbm_ht_get(dst->nodes_by_name, existing->name ? existing->name : ""),
+                    existing->id);
+            }
+            existing->label = (char *)new_label;
+            free(existing->name);
+            existing->name = heap_strdup(sn->name);
+            existing->file_path = (char *)gb_intern(dst, sn->file_path);
+            existing->start_line = sn->start_line;
+            existing->end_line = sn->end_line;
+            if (sn->properties_json) {
+                free(existing->properties_json);
+                existing->properties_json = heap_strdup(sn->properties_json);
+            }
+            if (label_changed) {
+                node_ptr_array_t *by_label = get_or_create_node_array(
+                    dst->nodes_by_label, existing->label ? existing->label : "");
+                cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
+            }
+            if (name_changed) {
+                node_ptr_array_t *by_name = get_or_create_node_array(
+                    dst->nodes_by_name, existing->name ? existing->name : "");
+                cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
+            }
         }
     }
 
