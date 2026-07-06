@@ -2324,13 +2324,31 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
 
     /* First try inherent method on the receiver itself, following any
      * type aliases (so `std.sync.Arc.clone` resolves through to
-     * `alloc.sync.Arc.clone` in the registry). */
+     * `alloc.sync.Arc.clone` in the registry). Stays BEFORE the memo check —
+     * a colliding real hit is always found (collision guard). */
     const CBMRegisteredFunc *inh =
         cbm_registry_lookup_method_aliased(reg, receiver_type_qn, method_name);
     if (inh) {
         if (out_impl_count)
             *out_impl_count = 1;
         return inh;
+    }
+
+    /* Negative memo (sealed registry only): this whole cascade — embedded-
+     * impl walk + trait-default tail — reads nothing but the registry and the
+     * two query strings, so under read_only a miss is a pure fact. Macro-
+     * expanded kernel rust asks the same failing (receiver, method) question
+     * thousands of times per file; without the memo each repeat re-paid the
+     * full walk (~63 s per trait-heavy file). Only the full miss (0 impls,
+     * no trait default) is memoized, preserving out_impl_count fidelity for
+     * the ambiguous (>=2 impls) case. */
+    bool nm_active = reg && reg->read_only;
+    uint64_t nm_key = 0;
+    if (nm_active) {
+        nm_key = cbm_negmemo_key(1, receiver_type_qn, method_name);
+        if (cbm_negmemo_contains(&ctx->neg_memo, nm_key)) {
+            return NULL;
+        }
     }
 
     /* Look at every type whose embedded_types include the receiver_type_qn
@@ -2364,7 +2382,12 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         *out_impl_count = impls;
     if (impls == 1)
         return unique;
-    return rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
+    const CBMRegisteredFunc *tm =
+        rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
+    if (nm_active && !tm && impls == 0) {
+        cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
+    }
+    return tm;
 }
 
 // True if `type_qn` implements a trait that declares `method_name` — i.e. a
@@ -2401,6 +2424,16 @@ static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, c
     if (!ctx || !trait_qn || !method_name)
         return NULL;
     const CBMTypeRegistry *reg = ctx->registry;
+    /* Negative memo (sealed registry only) — registry-pure cascade; only the
+     * zero-implementer miss is memoized (out_n fidelity for the 2+ case). */
+    bool nm_active = reg && reg->read_only;
+    uint64_t nm_key = 0;
+    if (nm_active) {
+        nm_key = cbm_negmemo_key(2, trait_qn, method_name);
+        if (cbm_negmemo_contains(&ctx->neg_memo, nm_key)) {
+            return NULL;
+        }
+    }
     const char *tdot = strrchr(trait_qn, '.');
     const char *tbare = tdot ? tdot + 1 : trait_qn;
     const CBMRegisteredFunc *first = NULL;
@@ -2441,6 +2474,9 @@ static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, c
     }
     if (out_n)
         *out_n = n;
+    if (nm_active && n == 0) {
+        cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
+    }
     return n == 1 ? first : NULL;
 }
 

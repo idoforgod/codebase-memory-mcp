@@ -27,6 +27,7 @@
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
+#include "lsp_neg_memo.h"
 #include "../cbm.h"
 #include "go_lsp.h" // for CBMLSPDef (pipeline def), used by the Tier-2 builder
 
@@ -57,6 +58,12 @@ typedef struct {
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+
+    /* Negative-lookup memo for the registry-pure resolve cascades (trait
+     * method / sole-trait-impl / free-func fallback). Active ONLY when the
+     * registry is sealed (read_only) — see lsp_neg_memo.h. Arena-backed,
+     * dies with the file. Zeroed by rust_lsp_init's memset (lazy alloc). */
+    CBMNegMemo neg_memo;
 
     /* `use` map: parallel arrays mapping a local-name (the last segment, or
      * the `as` alias) to its full module path (`std::collections::HashMap`,
