@@ -4499,7 +4499,7 @@ static int idxpar_recovery_check(const char *repo_dir) {
 
 TEST(index_recovery_parallel_quarantines_crasher) {
 #ifdef _WIN32
-    SKIP("POSIX fork harness (supervised recovery covered by smoke on Windows)");
+    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
 #else
     char tmp_dir[CBM_SZ_256];
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-XXXXXX");
